@@ -1,13 +1,19 @@
 """
-Парсер для сайта chop.moscow с извлечением статуса работы организации.
+ScraperELA · parsers/chop_moscow.py
+====================================
+Парсер сайта https://chop.moscow.
 """
 
-import re
-from urllib.parse import urlparse, urljoin
-from bs4 import BeautifulSoup
+from __future__ import annotations
 
+import re
+from urllib.parse import urljoin, urlparse
+
+from bs4 import BeautifulSoup, Tag
+from bs4.element import NavigableString
+
+from models import AggregatorStatus, CompanySchema
 from parsers.base import BaseParser
-from models import CompanySchema
 
 
 class ChopMoscowParser(BaseParser):
@@ -15,9 +21,18 @@ class ChopMoscowParser(BaseParser):
 
     BASE_URL = "https://chop.moscow"
 
+    _SKIP_SLUGS: frozenset[str] = frozenset(
+        {"page", "add", "search", "category", "filter"}
+    )
+
+    # -----------------------------------------------------------------------
+    # Листинг (каталог)
+    # -----------------------------------------------------------------------
+
     def parse_listing(self, html: str) -> list[str]:
+        """Извлекает уникальные URL карточек со страницы каталога."""
         soup = BeautifulSoup(html, "lxml")
-        urls: list[str] = []
+        urls: set[str] = set()
 
         for a_tag in soup.find_all("a", href=True):
             href = a_tag.get("href")
@@ -25,103 +40,234 @@ class ChopMoscowParser(BaseParser):
                 continue
 
             path = urlparse(href).path
-            match = re.search(r"^/catalog/([^/]+)/?$", path)
-            if match:
-                slug = match.group(1)
-                if slug not in {"page", "add", "search", "category", "filter"}:
-                    full_url = urljoin(self.BASE_URL, f"/catalog/{slug}/")
-                    urls.append(full_url)
+            match = re.fullmatch(r"/catalog/([^/]+)/?", path)
+            if not match:
+                continue
 
-        return list(set(urls))
+            slug = match.group(1)
+            if slug in self._SKIP_SLUGS:
+                continue
+
+            urls.add(urljoin(self.BASE_URL, f"/catalog/{slug}/"))
+
+        return list(urls)
+
+    # -----------------------------------------------------------------------
+    # Детальная карточка
+    # -----------------------------------------------------------------------
 
     def parse_detail(self, html: str, url: str) -> CompanySchema | None:
         soup = BeautifulSoup(html, "lxml")
-        text_content = soup.get_text()
 
-        # 1. Извлечение названия
-        h1_tag = soup.find("h1")
-        name = h1_tag.get_text(strip=True) if h1_tag else None
-        if name:
-            name = re.split(r":\s*", name, flags=re.IGNORECASE)[0].strip()
+        # 1. Название ---------------------------------------------------------
+        name = self._extract_name(soup)
+        if not name:
+            return None
 
-        # 2. Определение статуса работы организации
-        status = "Работает"
-        if soup.find(class_="cloze"):
-            status = "Компания больше не работает"
-        elif soup.find(class_="cloze-perhaps"):
-            status = "Компания, возможно, не работает"
+        # 2. Статус работы ----------------------------------------------------
+        status_aggregator = self._extract_status(soup)
 
-        # 3. Реквизиты
-        inn_match = re.search(r"ИНН\s*(\d{10,12})", text_content)
-        ogrn_match = re.search(r"ОГРН\s*(\d{13,15})", text_content)
-        kpp_match = re.search(r"КПП\s*(\d{9})", text_content)
-        reg_date_match = re.search(
-            r"Дата регистрации\s*(\d{2}\.\d{2}\.\d{4})", text_content
-        )
+        # 3. Реквизиты из DOM (span.contakt → strong) -------------------------
+        requisites = self._extract_all_requisites(soup)
 
-        # 4. Юридическое название
-        legal_name_match = re.search(r"Юридическое название:\s*([^.\n]+)", text_content)
-        legal_name = (
-            legal_name_match.group(1).replace('"', "").strip()
-            if legal_name_match
-            else None
-        )
+        inn = requisites.get("инн")
+        ogrn = requisites.get("огрн")
+        kpp_raw = requisites.get("кпп")
+        reg_date = requisites.get("дата регистрации")
+        director = requisites.get("руководитель")
+        legal_name = requisites.get("юридическое название")
 
-        # 5. ФИО руководителя
-        director_match = re.search(r"Руководитель\s*([^.\n]+)", text_content)
-        director = director_match.group(1).strip() if director_match else None
+        # КПП — может быть несколько (если на странице несколько span.contakt с КПП)
+        kpp_list: list[str] = []
+        if kpp_raw:
+            # Извлекаем все 9-значные числа из значения
+            kpp_list = re.findall(r"\d{9}", kpp_raw)
 
-        # 6. Адрес
-        address_span = soup.find(class_="adresch2")
-        address = address_span.get_text(strip=True) if address_span else None
+        # 4. Адрес ------------------------------------------------------------
+        address = self._extract_tag_text(soup, class_="adresch2")
 
-        # 7. Телефоны (Основной + Дополнительные)
-        phones_list: list[str] = []
+        # 5. Телефоны ---------------------------------------------------------
+        phones = self._extract_phones(soup)
 
-        tel_span = soup.find(class_="telch")
-        if tel_span:
-            phones_list.append(tel_span.get_text(strip=True))
+        # 6. Email ------------------------------------------------------------
+        emails = self._extract_emails(soup)
 
-        for p_tag in soup.find_all("p", class_="dop-info-p"):
-            p_text = p_tag.get_text(strip=True)
-            if "Доп. телефоны:" in p_text:
-                dop_part = p_text.replace("Доп. телефоны:", "").strip()
-                if dop_part:
-                    phones_list.append(dop_part)
-                break
-
-        phones_str = "; ".join(phones_list) if phones_list else None
-
-        # 8. Email
-        email_span = soup.find(class_="emailchop")
-        email = email_span.get_text(strip=True) if email_span else None
-
-        # 9. Сайт
-        website = None
-        site_a = soup.find("a", class_="sitech")
-        if site_a:
-            href = site_a.get("href", "")
-            if isinstance(href, str):
-                if "url=" in href:
-                    match = re.search(r"url=([^&/]+)", href)
-                    website = match.group(1) if match else site_a.get_text(strip=True)
-                else:
-                    website = (
-                        href if href.startswith("http") else site_a.get_text(strip=True)
-                    )
+        # 7. Сайт -------------------------------------------------------------
+        website = self._extract_website(soup)
 
         return CompanySchema(
             source_url=url,
             name=name,
             legal_name=legal_name,
-            status=status,  # Передаем статус
-            inn=inn_match.group(1) if inn_match else None,
-            ogrn=ogrn_match.group(1) if ogrn_match else None,
-            kpp=kpp_match.group(1) if kpp_match else None,
-            registration_date=reg_date_match.group(1) if reg_date_match else None,
+            inn=inn,
+            ogrn=ogrn,
+            kpp_list=kpp_list,
+            registration_date=reg_date,
             director=director,
             address=address,
-            phones=phones_str,
-            email=email,
+            phones=phones,
+            emails=emails,
             website=website,
+            status_aggregator=status_aggregator,
         )
+
+    # -----------------------------------------------------------------------
+    # Извлечение реквизитов из DOM
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_all_requisites(soup: BeautifulSoup) -> dict[str, str]:
+        """
+        Собирает все реквизиты из блоков <span class="contakt">.
+
+        Каждый блок имеет структуру:
+          <span class="contakt"><strong>Ключ</strong> Значение</span>
+          или
+          <span class="contakt"><strong>Ключ</strong><br>Значение</span>
+
+        Возвращает dict с нормализованными ключами (lowercase, без двоеточия):
+          {"руководитель": "Иванов Иван Иванович", "инн": "7721278319", ...}
+        """
+        result: dict[str, str] = {}
+
+        for span in soup.find_all("span", class_="contakt"):
+            if not isinstance(span, Tag):
+                continue
+
+            strong = span.find("strong")
+            if not strong or not isinstance(strong, Tag):
+                continue
+
+            # Ключ — текст внутри <strong>, нормализованный
+            key = strong.get_text(strip=True).lower().rstrip(":")
+
+            # Значение — всё что идёт ПОСЛЕ <strong> и <br> в этом же <span>
+            # Удаляем <strong> из копии, чтобы get_text() вернул только значение
+            # Но безопаснее — собрать текст вручную из siblings
+            value_parts: list[str] = []
+            for sibling in strong.next_siblings:
+                if isinstance(sibling, NavigableString):
+                    text = sibling.strip()
+                    if text:
+                        value_parts.append(text)
+                elif isinstance(sibling, Tag):
+                    if sibling.name == "br":
+                        continue  # Пропускаем <br>
+                    text = sibling.get_text(strip=True)
+                    if text:
+                        value_parts.append(text)
+
+            value = " ".join(value_parts).strip()
+            if value:
+                result[key] = value
+
+        return result
+
+    # -----------------------------------------------------------------------
+    # Вспомогательные методы
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_name(soup: BeautifulSoup) -> str | None:
+        """Берёт текст первого <h1>, отрезает всё после двоеточия."""
+        h1 = soup.find("h1")
+        if not h1 or not isinstance(h1, Tag):
+            return None
+        raw = h1.get_text(strip=True)
+        return re.split(r":\s+", raw, maxsplit=1)[0].strip() or None
+
+    @staticmethod
+    def _extract_status(soup: BeautifulSoup) -> str:
+        """Определяет статус организации по CSS-классам блоков-плашек."""
+        if soup.find(class_="cloze"):
+            return AggregatorStatus.CLOSED
+        if soup.find(class_="cloze-perhaps"):
+            return AggregatorStatus.MAYBE
+        return AggregatorStatus.ACTIVE
+
+    @staticmethod
+    def _extract_tag_text(soup: BeautifulSoup, class_: str) -> str | None:
+        tag = soup.find(class_=class_)
+        if not tag or not isinstance(tag, Tag):
+            return None
+        return tag.get_text(strip=True) or None
+
+    @staticmethod
+    def _extract_phones(soup: BeautifulSoup) -> list[str]:
+        """
+        Собирает основной телефон (.telch) и дополнительные (.dop-info-p).
+        Возвращает дедуплицированный список строк.
+        """
+        phones: list[str] = []
+        seen: set[str] = set()
+
+        def _add(value: str) -> None:
+            v = value.strip()
+            if v and v not in seen:
+                phones.append(v)
+                seen.add(v)
+
+        # Основной телефон
+        main = soup.find(class_="telch")
+        if main and isinstance(main, Tag):
+            _add(main.get_text(strip=True))
+
+        # Дополнительные телефоны
+        for p in soup.find_all("p", class_="dop-info-p"):
+            if not isinstance(p, Tag):
+                continue
+            p_text = p.get_text(strip=True)
+            if "Доп. телефоны:" not in p_text:
+                continue
+            dop = p_text.replace("Доп. телефоны:", "").strip()
+            for part in re.split(r"[,;]", dop):
+                _add(part)
+
+        return phones
+
+    @staticmethod
+    def _extract_emails(soup: BeautifulSoup) -> list[str]:
+        """
+        Собирает email из тега .emailchop и mailto-ссылок.
+        """
+        emails: list[str] = []
+        seen: set[str] = set()
+
+        def _add(value: str) -> None:
+            v = value.strip().lower()
+            if v and v not in seen:
+                emails.append(v)
+                seen.add(v)
+
+        email_tag = soup.find(class_="emailchop")
+        if email_tag and isinstance(email_tag, Tag):
+            _add(email_tag.get_text(strip=True))
+
+        for a in soup.find_all("a", href=re.compile(r"^mailto:")):
+            if not isinstance(a, Tag):
+                continue
+            href = a.get("href", "")
+            if isinstance(href, str):
+                _add(href.replace("mailto:", ""))
+
+        return emails
+
+    @staticmethod
+    def _extract_website(soup: BeautifulSoup) -> str | None:
+        """Извлекает сайт из ссылки .sitech, обрабатывая редиректы."""
+        site_a = soup.find("a", class_="sitech")
+        if not site_a or not isinstance(site_a, Tag):
+            return None
+
+        href = site_a.get("href", "")
+        if not isinstance(href, str) or not href:
+            return None
+
+        if "url=" in href:
+            match = re.search(r"url=([^&]+)", href)
+            return match.group(1) if match else site_a.get_text(strip=True) or None
+
+        if href.startswith("http"):
+            return href
+
+        return site_a.get_text(strip=True) or None

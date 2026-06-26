@@ -4,7 +4,8 @@
         "**/.svn": true,
         "**/.hg": true,
         "**/.DS_Store": true,
-        ".venv": true
+        ".venv": true,
+        "**/*cache*": true
     },
-    "explorer.excludeGitIgnore": true
+    "python.terminal.useEnvFile": true
 }

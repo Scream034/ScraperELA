@@ -1,7 +1,23 @@
-**/*.pyc
-**/*.pyo
-**/*.db*
-**/*cache*/
+# Секреты — никогда не коммитить
+.env
 
-# Папки
+# Данные парсера (БД, кэш, экспорты, логи)
 data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
