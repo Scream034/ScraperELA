@@ -1,4 +1,6 @@
 {
+    "python.envFile": "${workspaceFolder}/.env",
+    "python.terminal.useEnvFile": true,
     "files.exclude": {
         "**/.git": true,
         "**/.svn": true,
@@ -6,6 +8,5 @@
         "**/.DS_Store": true,
         ".venv": true,
         "**/*cache*": true
-    },
-    "python.terminal.useEnvFile": true
+    }
 }

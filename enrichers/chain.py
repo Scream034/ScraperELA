@@ -57,8 +57,9 @@ class EnrichmentChain:
     # -----------------------------------------------------------------------
 
     async def enrich(self, inn: str) -> EnrichmentResult | None:
-        """
-        Запрашивает статус юрлица по ИНН, обходя провайдеров по приоритету.
+        """Запрашивает статус юрлица по ИНН, обходя провайдеров по приоритету.
+
+        Вызывает ``provider.enrich()`` (кэш-aware), а не ``enrich_by_inn`` напрямую.
 
         Args:
             inn: ИНН организации (10 или 12 цифр).
@@ -69,7 +70,6 @@ class EnrichmentChain:
         for provider in self._providers:
             provider_tag = f"[{provider.provider_name}]"
 
-            # --- Шаг 1: проверяем доступность ------------------------------------
             try:
                 available = await provider.is_available()
             except Exception as exc:
@@ -86,9 +86,9 @@ class EnrichmentChain:
                 )
                 continue
 
-            # --- Шаг 2: запрашиваем данные --------------------------------------
             try:
-                result = await provider.enrich_by_inn(inn)
+                # enrich() — кэш-aware обёртка над enrich_by_inn()
+                result = await provider.enrich(inn)
             except Exception as exc:
                 logger.warning(
                     f"{provider_tag} Ошибка при обогащении ИНН={inn}. "
@@ -109,9 +109,8 @@ class EnrichmentChain:
                 "Переход к следующему провайдеру."
             )
 
-        # --- Все провайдеры исчерпаны -------------------------------------------
         logger.warning(
-            f"Все провайдеры исчерпаны для ИНН={inn}. " "Обогащение не выполнено."
+            f"Все провайдеры исчерпаны для ИНН={inn}. Обогащение не выполнено."
         )
         return None
 
@@ -121,8 +120,7 @@ class EnrichmentChain:
         inn_key: str = "inn",
         url_key: str = "source_url",
     ) -> dict[str, EnrichmentResult]:
-        """
-        Обогащает пакет записей последовательно.
+        """Обогащает пакет записей последовательно с отображением прогресса.
 
         Args:
             records:  Список dict с ключами inn_key и url_key.
@@ -134,6 +132,8 @@ class EnrichmentChain:
         """
         results: dict[str, EnrichmentResult] = {}
         total = len(records)
+        success = 0
+        cache_hits = 0
 
         for idx, record in enumerate(records, 1):
             inn: str | None = record.get(inn_key)
@@ -143,14 +143,32 @@ class EnrichmentChain:
                 logger.debug(f"[{idx}/{total}] Нет ИНН для {url}, пропускаем.")
                 continue
 
-            logger.debug(f"[{idx}/{total}] Обогащение: {url} (ИНН={inn})")
+            # --- Прогресс ---
+            pct = idx / total * 100
+            logger.info(f"[{idx}/{total}] ({pct:.1f}%) Обогащение ИНН={inn}")
+
             result = await self.enrich(inn)
 
             if result is not None:
                 results[url] = result
+                success += 1
+                # Считаем кэш-хиты: если verified_at старше минуты — скорее всего кэш
+                try:
+                    from datetime import datetime as _dt
+
+                    age_sec = (
+                        _dt.now()
+                        - _dt.strptime(result.verified_at, "%Y-%m-%d %H:%M:%S")
+                    ).total_seconds()
+                    if age_sec > 60:
+                        cache_hits += 1
+                except Exception:
+                    pass
 
         logger.info(
-            f"Пакетное обогащение завершено. " f"Успешно: {len(results)}/{total}."
+            f"Пакетное обогащение завершено. "
+            f"Успешно: {success}/{total} "
+            f"(~{cache_hits} из кэша, ~{success - cache_hits} свежих запросов)."
         )
         return results
 

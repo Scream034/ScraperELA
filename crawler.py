@@ -3,10 +3,10 @@ ScraperELA · crawler.py
 ========================
 Оркестратор параллельного сбора данных.
 
-v4 — Изменения:
-  • site_key передаётся при инициализации — записывается в company_sources и queue.
-  • get_next_task() возвращает (url, site_key) — воркер знает источник задачи.
-  • AdaptiveConcurrencyController и _AdaptiveGate без изменений.
+v5 — Изменения:
+  • Добавлен механизм детектирования дублирования контента страниц (frozenset-сверка)
+    для предотвращения бесконечного цикла на сайтах, зацикливающих последнюю страницу пагинации.
+  • Поддержка динамических шаблонов пагинации page_pattern.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from pathlib import Path
 
 import httpx
 
-import config
 from database import DatabaseManager
 from fetchers import BaseFetcher
 from parsers.base import BaseParser
@@ -160,6 +159,7 @@ class AsyncCrawler:
         stats_file_path: Path | None = None,
         min_concurrency: int | None = None,
         max_concurrency: int | None = None,
+        page_pattern: str | None = None,
     ) -> None:
         self.db = db
         self.fetcher = fetcher
@@ -167,6 +167,7 @@ class AsyncCrawler:
         self.site_key = site_key
         self.delay = request_delay
         self.stats_file_path = stats_file_path
+        self.page_pattern = page_pattern or "{base_url}page/{page}/"
 
         self._min_c = min_concurrency or max(1, concurrency // 2)
         self._max_c = max_concurrency or concurrency * 2
@@ -187,6 +188,9 @@ class AsyncCrawler:
         self.catalog_page_counter = 1
         self.catalog_lock = asyncio.Lock()
         self.should_stop_catalog = False
+
+        # Хранилище отпечатков страниц каталога для сверки дубликатов
+        self.catalog_pages_data: dict[int, frozenset[str]] = {}
 
         # Метрики
         self.stats_start_time = 0.0
@@ -209,7 +213,10 @@ class AsyncCrawler:
             if max_pages > 0 and page > max_pages:
                 break
 
-            url = base_url if page == 1 else f"{base_url}page/{page}/"
+            if page == 1:
+                url = base_url
+            else:
+                url = self.page_pattern.format(base_url=base_url, page=page)
 
             try:
                 t0 = time.perf_counter()
@@ -225,6 +232,27 @@ class AsyncCrawler:
                     logger.info(f"[{self.site_key}] Каталог стр.{page} пуста. Конец.")
                     self.should_stop_catalog = True
                     break
+
+                # --- Section: Проверка зацикливания/дублирования страниц ---
+                urls_set = frozenset(urls)
+                async with self.catalog_lock:
+                    is_duplicate = False
+                    dup_page = 0
+                    for parsed_page, parsed_set in self.catalog_pages_data.items():
+                        if parsed_set == urls_set:
+                            is_duplicate = True
+                            dup_page = parsed_page
+                            break
+
+                    if is_duplicate:
+                        logger.info(
+                            f"[{self.site_key}] Каталог стр.{page} дублирует контент "
+                            f"стр.{dup_page} (сервер зациклил вывод). Сбор каталога завершен."
+                        )
+                        self.should_stop_catalog = True
+                        break
+
+                    self.catalog_pages_data[page] = urls_set
 
                 added = await self.db.add_to_queue(urls, self.site_key)
                 logger.info(
@@ -255,12 +283,16 @@ class AsyncCrawler:
         catalog_concurrency: int,
     ) -> None:
         """Запускает пул воркеров скользящего окна."""
+        if not catalog_base_url.endswith("/"):
+            catalog_base_url = f"{catalog_base_url}/"
+
         logger.info(
             f"[{self.site_key}] Скользящее окно: {catalog_concurrency} воркеров, "
             f"max_pages={max_pages or '∞'}."
         )
         self.catalog_page_counter = 1
         self.should_stop_catalog = False
+        self.catalog_pages_data.clear()
 
         await asyncio.gather(
             *[
@@ -283,7 +315,7 @@ class AsyncCrawler:
         while True:
             await self._gate.acquire()
             try:
-                task = await self.db.get_next_task()
+                task = await self.db.get_next_task(self.site_key)
                 if not task:
                     break
 
@@ -343,9 +375,9 @@ class AsyncCrawler:
         Запускает детальный парсинг всей очереди.
         Стартует MAX воркеров — избыточные ждут на gate.acquire().
         """
-        await self.db.reset_processing_tasks()
+        await self.db.reset_processing_tasks(self.site_key)
 
-        self.total_tasks = await self.db.get_pending_tasks_count()
+        self.total_tasks = await self.db.get_pending_tasks_count(self.site_key)
         self.processed_tasks = 0
 
         if self.total_tasks == 0:

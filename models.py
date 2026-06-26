@@ -11,17 +11,25 @@ ScraperELA · models.py
   • Только enricher  — status_official, inn_verified, legal_name_official,
                        official_verified_at, provider_name
 
+Дедупликация телефонов:
+  Аннотации вида «(факс)», «(отдел кадров)» удаляются перед хранением.
+  Дедупликация производится по цифровому отпечатку (только цифры номера),
+  что исключает дубли вида «+7 (495) 123-45-67» и «+7 (495) 123-45-67 (факс)».
+
+Нормализация website:
+  _normalize_website() — публичная утилита, используется также в database.py
+  для кросс-сайтового слияния компаний по сайту.
+
 Совместимость с Pyright/Pylance (без pydantic-плагина):
   Все необязательные поля используют паттерн
       field: Annotated[T, Field(description=...)] = default
   вместо
       field: T = Field(default, description=...)
-  Это единственный способ дать Pyright понять что поле имеет дефолт
-  и не является обязательным аргументом конструктора.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -52,6 +60,43 @@ class OfficialStatus:
 
 
 # ---------------------------------------------------------------------------
+# Утилиты нормализации (публичные — используются в database.py)
+# ---------------------------------------------------------------------------
+
+# Паттерн для текстовых аннотаций в конце телефона:
+# «+7 (495) 123-45-67 (факс)» → «+7 (495) 123-45-67»
+# Матчит последнюю скобочную группу, содержащую хотя бы одну букву.
+_PHONE_ANNOTATION_RE = re.compile(
+    r"\s*\([^)]*[а-яёА-ЯЁa-zA-Z][^)]*\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def normalize_website(raw: str) -> str:
+    """Нормализует URL сайта для надёжного сравнения между источниками.
+
+    Преобразования::
+
+        "http://www.akbnovikov.com/"  → "akbnovikov.com"
+        "https://AKBNovikov.COM"      → "akbnovikov.com"
+        "akbnovikov.com/"             → "akbnovikov.com"
+
+    Args:
+        raw: Сырое значение поля website.
+
+    Returns:
+        Нормализованный домен в нижнем регистре без схемы, www и trailing slash.
+    """
+    v = raw.strip().lower()
+    for scheme in ("https://", "http://"):
+        if v.startswith(scheme):
+            v = v[len(scheme) :]
+    if v.startswith("www."):
+        v = v[4:]
+    return v.rstrip("/")
+
+
+# ---------------------------------------------------------------------------
 # CompanySchema
 # ---------------------------------------------------------------------------
 
@@ -75,8 +120,6 @@ class CompanySchema(BaseModel):
     source_url: str = Field(..., description="URL детальной страницы")
 
     # --- Иммутабельные реквизиты --------------------------------------------
-    # Annotated + правосторонний дефолт — единственный Pyright-совместимый
-    # способ сочетать Field(description=) с необязательным аргументом.
     inn: Annotated[str | None, Field(description="ИНН (10 или 12 цифр)")] = None
     ogrn: Annotated[str | None, Field(description="ОГРН (13 или 15 цифр)")] = None
     registration_date: Annotated[
@@ -185,6 +228,15 @@ class CompanySchema(BaseModel):
             return None
         return value
 
+    @field_validator("website", mode="after")
+    @classmethod
+    def _normalize_website_field(cls, value: str | None) -> str | None:
+        """Нормализует URL сайта: убирает схему, www и trailing slash."""
+        if not value:
+            return None
+        normalized = normalize_website(value)
+        return normalized or None
+
     @field_validator("phones", "emails", "kpp_list", mode="before")
     @classmethod
     def _ensure_list(cls, value: Any) -> list[Any]:
@@ -198,16 +250,35 @@ class CompanySchema(BaseModel):
     @field_validator("phones", mode="after")
     @classmethod
     def _deduplicate_phones(cls, value: list[str]) -> list[str]:
-        seen: dict[str, None] = {}
+        """Дедуплицирует телефоны по цифровому отпечатку.
+
+        Перед дедупликацией удаляет текстовые аннотации в конце строки,
+        например «(факс)», «(отдел кадров)», «(круглосуточный)».
+
+        Примеры::
+
+            "+7 (495) 123-45-67 (факс)"  → "+7 (495) 123-45-67"
+            "+7 (495) 123-45-67"         → "+7 (495) 123-45-67"  (дубль отброшен)
+        """
+        # digits → clean representation (первое вхождение побеждает)
+        seen: dict[str, str] = {}
         for v in value:
             stripped = v.strip()
-            if stripped:
-                seen[stripped] = None
-        return list(seen.keys())
+            if not stripped:
+                continue
+            # Убираем текстовую аннотацию в конце: «число (текст)»
+            clean = _PHONE_ANNOTATION_RE.sub("", stripped).strip()
+            digits = "".join(filter(str.isdigit, clean or stripped))
+            if len(digits) < 7:
+                continue
+            if digits not in seen:
+                seen[digits] = clean if clean else stripped
+        return list(seen.values())
 
     @field_validator("emails", mode="after")
     @classmethod
     def _deduplicate_emails(cls, value: list[str]) -> list[str]:
+        """Дедуплицирует email-адреса без учёта регистра."""
         seen: dict[str, None] = {}
         for v in value:
             normalized = v.strip().lower()
@@ -259,10 +330,19 @@ class EnrichmentResult(BaseModel):
     legal_name_official: Annotated[
         str | None, Field(description="Официальное наименование из реестра")
     ] = None
+    liquidation_date: Annotated[
+        str | None, Field(description="Дата ликвидации организации (YYYY-MM-DD)")
+    ] = None
+    director_official: Annotated[
+        str | None, Field(description="Официальный ФИО руководителя из ЕГРЮЛ")
+    ] = None
+    address_official: Annotated[
+        str | None, Field(description="Официальный юридический адрес из ЕГРЮЛ")
+    ] = None
     verified_at: Annotated[
         str,
-        Field(description="ISO-таймстамп момента запроса к провайдеру"),
-    ] = Field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+        Field(description="Таймстамп проверки по реестру (YYYY-MM-DD HH:MM:SS)"),
+    ] = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     provider_name: str = Field(..., description="Идентификатор провайдера")
 
     @field_validator("inn_verified", mode="before")

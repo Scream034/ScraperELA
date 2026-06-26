@@ -19,11 +19,11 @@ ScraperELA · enrichers/dadata_provider.py
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
 import httpx
 
-import config
 from enrichers.base import BaseEnricher
 from models import EnrichmentResult, OfficialStatus
 
@@ -43,32 +43,32 @@ _SUGGESTIONS_URL = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findByI
 
 
 class DadataEnricher(BaseEnricher):
-    """
-    Первичный провайдер обогащения.
-    Использует DaData Suggestions API для поиска юрлиц по ИНН в базе ЕГРЮЛ.
-    """
+    """Первичный провайдер обогащения через DaData Suggestions API."""
 
     def __init__(
         self,
         api_key: str,
         secret_key: str,
         daily_limit: int = 10_000,
+        cache_dir: Path | None = None,
+        cache_ttl_days: int | None = None,
     ) -> None:
         """
         Args:
-            api_key:     Token для заголовка Authorization.
-            secret_key:  Секретный ключ (X-Secret) — нужен для Clean API,
-                         передаётся для полноты конфигурации.
-            daily_limit: Максимальное число запросов в сутки.
+            api_key:        Token для заголовка Authorization.
+            secret_key:     Секретный ключ (X-Secret).
+            daily_limit:    Максимальное число запросов в сутки.
+            cache_dir:      Директория файлового кэша. None — кэш отключён.
+            cache_ttl_days: TTL кэша в днях. None → берётся из конфига.
         """
+        import config as _config
+
         self._api_key = api_key.strip()
         self._secret_key = secret_key.strip()
         self._daily_limit = daily_limit
-
-        # Дневной счётчик с маркером текущей даты
         self._daily_count: int = 0
         self._day_marker: date = date.today()
-        self._limit_exhausted = False  # флаг 402/429 от сервера
+        self._limit_exhausted = False
 
         self._client = httpx.AsyncClient(
             headers={
@@ -78,6 +78,16 @@ class DadataEnricher(BaseEnricher):
                 "X-Secret": self._secret_key,
             },
             timeout=httpx.Timeout(10.0, connect=5.0),
+        )
+
+        # Инициализация кэша (из BaseEnricher)
+        self._init_cache(
+            cache_dir=cache_dir,
+            ttl_days=(
+                cache_ttl_days
+                if cache_ttl_days is not None
+                else _config.ENRICHMENT_CACHE_TTL_DAYS
+            ),
         )
 
     # -----------------------------------------------------------------------
@@ -127,15 +137,7 @@ class DadataEnricher(BaseEnricher):
         return True
 
     async def enrich_by_inn(self, inn: str) -> EnrichmentResult | None:
-        """
-        Запрашивает карточку юрлица по ИНН через DaData Suggestions API.
-
-        Returns:
-            EnrichmentResult при успехе, None если ИНН не найден в ЕГРЮЛ.
-
-        Raises:
-            httpx.HTTPError — при сетевых сбоях (перехватывается EnrichmentChain).
-        """
+        """Запрашивает расширенную карточку юрлица по ИНН через DaData."""
         try:
             response = await self._client.post(
                 _SUGGESTIONS_URL,
@@ -145,13 +147,9 @@ class DadataEnricher(BaseEnricher):
             logger.warning(f"DaData: Сетевой сбой при запросе ИНН={inn}: {exc}")
             raise
 
-        # Обрабатываем статусы лимитов
         if response.status_code in (402, 429):
             self._limit_exhausted = True
-            logger.warning(
-                f"DaData: Сервер вернул {response.status_code}. "
-                "Лимит запросов исчерпан. Провайдер отключается до следующего дня."
-            )
+            logger.warning(f"DaData: Превышен лимит запросов ({response.status_code}).")
             raise httpx.HTTPStatusError(
                 f"DaData limit reached: {response.status_code}",
                 request=response.request,
@@ -168,9 +166,25 @@ class DadataEnricher(BaseEnricher):
             return None
 
         suggestion = suggestions[0]
-        party_data = suggestion.get("data", {})
-        state = party_data.get("state", {})
-        name_block = party_data.get("name", {})
+        party_data = suggestion.get("data", {}) or {}
+        state = party_data.get("state", {}) or {}
+        name_block = party_data.get("name", {}) or {}
+        management = party_data.get("management", {}) or {}
+        address_block = party_data.get("address", {}) or {}
+
+        # Получаем численность персонала и официального руководителя
+        director_official = management.get("name")
+        address_official = address_block.get("value")
+
+        # Парсим дату ликвидации (DaData отдает Unix-таймстамп в миллисекундах)
+        liq_timestamp_ms = state.get("liquidation_date")
+        liquidation_date_str = None
+        if liq_timestamp_ms:
+            try:
+                liq_dt = datetime.fromtimestamp(liq_timestamp_ms / 1000.0)
+                liquidation_date_str = liq_dt.strftime("%Y-%m-%d")
+            except Exception:
+                pass
 
         raw_status = state.get("status", "")
         status_official = _DADATA_STATUS_MAP.get(raw_status, OfficialStatus.UNKNOWN)
@@ -183,6 +197,9 @@ class DadataEnricher(BaseEnricher):
             status_official=status_official,
             inn_verified=inn_verified,
             legal_name_official=legal_name,
+            liquidation_date=liquidation_date_str,
+            director_official=director_official,
+            address_official=address_official,
             provider_name=self.provider_name,
         )
 
