@@ -17,6 +17,7 @@ import config
 from crawler import AsyncCrawler
 from database import DatabaseManager
 from enrichers import DadataEnricher, EnrichmentChain, FnsEgrulEnricher
+from enrichers.website_contact import WebsiteContactScanner
 from exporter import export_sqlite_to_xlsx
 from fetchers import AsyncHttpxFetcher
 from parsers.chop_moscow import ChopMoscowParser
@@ -52,6 +53,11 @@ def setup_logging(log_file_path: Path) -> None:
         handler.setLevel(level)
         handler.setFormatter(fmt)
         root.addHandler(handler)
+
+    # Глушим шумные библиотеки — их HTTP-запросы засоряют лог.
+    # Детали по-прежнему доступны при LOG_LEVEL=DEBUG.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # --- Section: Конвейер отдельного сайта (Site Pipeline) ---
@@ -248,7 +254,7 @@ async def main() -> None:
         await db.connect()
         logger.info(f"Подключение к SQLite установлено: {db_file.name}")
 
-        # Запуск асинхронных конвейеров сайтов
+        # Запуск асинхронных конвейеров
         if config.RUN_CATALOG_SCAN or config.RUN_DETAIL_PARSER:
             logger.info("▶ Запуск асинхронных конвейеров сайтов...")
             try:
@@ -259,9 +265,6 @@ async def main() -> None:
                 for exc in eg.exceptions:
                     logger.error(f"Сбой внутри группы конвейеров: {exc}", exc_info=exc)
 
-            # Дедупликация запускается ПОСЛЕ краулеров — всегда, не за флагом.
-            # Причина: краулеры могут создавать дубли (level-4 не срабатывает
-            # если у существующей записи ещё нет телефонов в момент INSERT).
             logger.info("▶ Фаза 2.5: Дедупликация после парсинга")
             dedup_stats = await db.run_dedup_pass()
             logger.info(
@@ -270,6 +273,43 @@ async def main() -> None:
             )
         else:
             logger.info("⏭ Парсинг пропущен (обе фазы отключены в конфиге)")
+
+        # Сканирование сайтов компаний
+        if config.RUN_WEBSITE_CONTACT_SCAN:
+            logger.info("▶ Фаза 2.7: Сканирование сайтов компаний")
+
+            scan_filters = config.WEBSITE_SCAN_CONFIG
+            only_wo_email = scan_filters.get("filter_only_without_email", True)
+            filter_desc = " | ".join(filter(None, [
+                f"город='{v}'" if (v := scan_filters.get("filter_city")) else None,
+                f"источник='{v}'" if (v := scan_filters.get("filter_site_key")) else None,
+                f"статус={v}" if (v := scan_filters.get("filter_status_official")) else None,
+                "только_без_email" if only_wo_email else "все_с_сайтом",
+                f"лимит={config.WEBSITE_SCAN_BATCH_SIZE}" if config.WEBSITE_SCAN_BATCH_SIZE else None,
+            ])) or "без фильтров"
+            logger.info(f"Фильтры сканирования: {filter_desc}")
+
+            scanner = WebsiteContactScanner(
+                db=db,
+                concurrency=config.WEBSITE_SCAN_CONCURRENCY,
+                delay=config.WEBSITE_SCAN_DELAY,
+                timeout=config.WEBSITE_SCAN_TIMEOUT,
+                max_pages=config.WEBSITE_SCAN_MAX_PAGES,
+                cache_dir=data_dir / "cache_websites",
+            )
+            try:
+                scan_stats = await scanner.run(
+                    limit=config.WEBSITE_SCAN_BATCH_SIZE,
+                    filters=scan_filters,
+                )
+                logger.info(
+                    f"✓ Сканирование: "
+                    f"email=+{scan_stats['emails_found']}, "
+                    f"тел=+{scan_stats['phones_found']}, "
+                    f"ошибок={scan_stats['failed']}."
+                )
+            finally:
+                await scanner.close()
 
         if config.RUN_ENRICHMENT:
             logger.info("▶ Фаза 3: Обогащение по ИНН")

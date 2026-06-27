@@ -11,10 +11,12 @@ from enrichers.base import BaseEnricher
 from enrichers.chain import EnrichmentChain
 from enrichers.dadata_provider import DadataEnricher
 from enrichers.fns_provider import FnsEgrulEnricher
+from enrichers.website_contact import WebsiteContactScanner
 
 __all__ = [
     "BaseEnricher",
     "EnrichmentChain",
     "DadataEnricher",
     "FnsEgrulEnricher",
+    "WebsiteContactScanner",
 ]

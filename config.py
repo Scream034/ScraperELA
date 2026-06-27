@@ -64,8 +64,7 @@ def _list(key: str, default: list[str]) -> list[str]:
 
 
 def _parse_sort_by(key: str, default: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    """
-    Разбирает строку сортировки вида 'name:ASC,scrape_date:DESC'
+    """Разбирает строку сортировки вида 'name:ASC,scrape_date:DESC'
     в список кортежей (поле, направление).
     """
     val = os.environ.get(key)
@@ -88,6 +87,7 @@ def _parse_sort_by(key: str, default: list[tuple[str, str]]) -> list[tuple[str, 
 # =====================================================================
 
 RUN_CATALOG_SCAN: bool = _bool("RUN_CATALOG_SCAN", False)
+RUN_WEBSITE_CONTACT_SCAN: bool = _bool("RUN_WEBSITE_CONTACT_SCAN", False)
 RUN_DETAIL_PARSER: bool = _bool("RUN_DETAIL_PARSER", False)
 RUN_ENRICHMENT: bool = _bool("RUN_ENRICHMENT", True)
 RUN_EXPORTER: bool = _bool("RUN_EXPORTER", True)
@@ -95,7 +95,6 @@ RUN_EXPORTER: bool = _bool("RUN_EXPORTER", True)
 ACTIVE_SITE: str = _secret("ACTIVE_SITE", "chop_moscow")
 ACTIVE_SITES: list[str] = _list("ACTIVE_SITE", ["chop_moscow"])
 
-# Максимальное число сайтов, собираемых одновременно
 MAX_CONCURRENT_SITES: int = _int("MAX_CONCURRENT_SITES", 4)
 
 
@@ -198,7 +197,6 @@ FNS_REQUEST_DELAY: float = _float("FNS_REQUEST_DELAY", 2.0)
 # 8. ИЗОЛИРОВАННЫЕ ПРАВИЛА ФИЛЬТРАЦИИ И СОРТИРОВКИ
 # =====================================================================
 
-# Конфигурация экспорта в XLSX
 EXPORT_CONFIG: dict[str, Any] = {
     "filter_city": _secret("EXPORT_FILTER_CITY") or None,
     "filter_site_key": _secret("EXPORT_FILTER_SITE_KEY") or None,
@@ -209,10 +207,24 @@ EXPORT_CONFIG: dict[str, Any] = {
     "limit": _int("EXPORT_LIMIT", 0),
 }
 
-# Конфигурация обогащения (полностью отделена от экспорта!)
 ENRICHMENT_CONFIG: dict[str, Any] = {
     "filter_city": _secret("ENRICHMENT_FILTER_CITY") or None,
     "filter_site_key": _secret("ENRICHMENT_FILTER_SITE_KEY") or None,
+}
+
+# Конфигурация фазы сканирования сайтов компаний.
+# filter_only_without_email: True  — сканировать только компании без email
+#                                    (экономит время при повторных запусках).
+#                            False — сканировать все компании с website
+#                                    (например, после расширения логики парсинга).
+# filter_status_official:    Ограничить сканирование по статусу из ЕГРЮЛ.
+#                            Пример: ACTIVE — только действующие.
+#                            Пусто  — без ограничений.
+WEBSITE_SCAN_CONFIG: dict[str, Any] = {
+    "filter_city": _secret("WEBSITE_SCAN_FILTER_CITY") or None,
+    "filter_site_key": _secret("WEBSITE_SCAN_FILTER_SITE_KEY") or None,
+    "filter_status_official": _secret("WEBSITE_SCAN_FILTER_STATUS_OFFICIAL") or None,
+    "filter_only_without_email": _bool("WEBSITE_SCAN_FILTER_ONLY_WITHOUT_EMAIL", True),
 }
 
 
@@ -236,3 +248,14 @@ def check_secrets() -> None:
     for name, value in secrets.items():
         print(f"  {name:<22} {'✓ задан' if value else '✗ не задан'}")
     print(f"{'=' * 45}\n")
+
+
+# =====================================================================
+# 10. СКАНИРОВАНИЕ САЙТОВ КОМПАНИЙ
+# =====================================================================
+
+WEBSITE_SCAN_CONCURRENCY: int = _int("WEBSITE_SCAN_CONCURRENCY", 5)
+WEBSITE_SCAN_DELAY: float = _float("WEBSITE_SCAN_DELAY", 1.0)
+WEBSITE_SCAN_TIMEOUT: float = _float("WEBSITE_SCAN_TIMEOUT", 15.0)
+WEBSITE_SCAN_MAX_PAGES: int = _int("WEBSITE_SCAN_MAX_PAGES", 4)
+WEBSITE_SCAN_BATCH_SIZE: int = _int("WEBSITE_SCAN_BATCH_SIZE", 0)

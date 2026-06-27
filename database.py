@@ -1320,3 +1320,147 @@ class DatabaseManager:
             async with conn.execute(q, p) as cur:
                 row = await cur.fetchone()
                 return int(row[0]) if row else 0
+
+    # -----------------------------------------------------------------------
+    # Website Contact Scanner API
+    # -----------------------------------------------------------------------
+
+    async def get_companies_for_website_scan(
+        self,
+        limit: int = 0,
+        filters: dict[str, Any] | None = None,
+    ) -> list[Row]:
+        """Возвращает компании с сайтом для сканирования контактов.
+
+        Приоритет: сначала компании без email-контактов, затем остальные.
+
+        Args:
+            limit:   Максимум записей (0 — без лимита).
+            filters: Словарь ``config.WEBSITE_SCAN_CONFIG`` с фильтрами.
+
+        Returns:
+            Список строк с полями ``company_id`` и ``website``.
+        """
+        where_parts = [
+            "c.website IS NOT NULL",
+            "c.website != ''",
+        ]
+        params: list[Any] = []
+
+        if filters:
+            if city := filters.get("filter_city"):
+                where_parts.append("c.address LIKE ? COLLATE NOCASE")
+                params.append(f"%{city}%")
+
+            if site_key := filters.get("filter_site_key"):
+                where_parts.append("""
+                    EXISTS (
+                        SELECT 1 FROM company_sources cs_f
+                         WHERE cs_f.company_id = c.company_id
+                           AND cs_f.site_key   = ?
+                    )
+                """)
+                params.append(site_key)
+
+            if status := filters.get("filter_status_official"):
+                where_parts.append("c.status_official = ?")
+                params.append(status)
+
+            # Только компании без email — экономит время при повторных запусках.
+            # Компании, у которых email уже найден, пропускаются.
+            if filters.get("filter_only_without_email", True):
+                where_parts.append("""
+                    NOT EXISTS (
+                        SELECT 1 FROM company_contacts cc_f
+                         WHERE cc_f.company_id   = c.company_id
+                           AND cc_f.contact_type = 'email'
+                    )
+                """)
+
+        limit_sql = f"LIMIT {limit}" if limit > 0 else ""
+
+        async with self._locked() as conn:
+            return await self._fetchall(
+                conn,
+                f"""
+                SELECT c.company_id, c.website
+                  FROM companies c
+                 WHERE {' AND '.join(where_parts)}
+                 ORDER BY c.company_id ASC
+                 {limit_sql}
+                """,
+                tuple(params),
+            )
+
+    async def save_website_contacts(
+        self,
+        company_id: int,
+        emails: list[str],
+        phones: list[str],
+    ) -> tuple[int, int]:
+        """Сохраняет контакты, найденные на сайте компании.
+
+        Телефоны дедуплицируются по digit-fingerprint против уже имеющихся.
+        Email дедуплицируются через ``ON CONFLICT DO NOTHING``.
+
+        Args:
+            company_id: PK компании.
+            emails:     Список email-адресов (уже валидированных).
+            phones:     Список телефонов (уже нормализованных).
+
+        Returns:
+            Кортеж ``(new_emails, new_phones)``.
+        """
+        from datetime import datetime as _dt
+
+        now = _dt.now().strftime("%Y-%m-%d")
+        new_emails = 0
+        new_phones = 0
+
+        async with self._locked() as conn:
+            for email in emails:
+                normalized = email.strip().lower()
+                if not normalized:
+                    continue
+                await conn.execute(
+                    """
+                    INSERT INTO company_contacts
+                        (company_id, contact_type, value, first_seen_at, last_seen_at)
+                    VALUES (?, 'email', ?, ?, ?)
+                    ON CONFLICT(company_id, contact_type, value) DO NOTHING
+                    """,
+                    (company_id, normalized, now, now),
+                )
+                async with conn.execute("SELECT changes()") as cur:
+                    row = await cur.fetchone()
+                    if row and row[0]:
+                        new_emails += row[0]
+
+            existing_rows = await self._fetchall(
+                conn,
+                "SELECT value FROM company_contacts "
+                "WHERE company_id = ? AND contact_type = 'phone'",
+                (company_id,),
+            )
+            existing_digits: set[str] = {
+                _phone_digits(r["value"]) for r in existing_rows
+            }
+
+            for phone in phones:
+                digits = _phone_digits(phone)
+                if not digits or len(digits) < 7 or digits in existing_digits:
+                    continue
+                await conn.execute(
+                    """
+                    INSERT INTO company_contacts
+                        (company_id, contact_type, value, first_seen_at, last_seen_at)
+                    VALUES (?, 'phone', ?, ?, ?)
+                    """,
+                    (company_id, phone, now, now),
+                )
+                existing_digits.add(digits)
+                new_phones += 1
+
+            await conn.commit()
+
+        return new_emails, new_phones
