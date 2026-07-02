@@ -22,12 +22,14 @@ from exporter import export_sqlite_to_xlsx
 from fetchers import AsyncHttpxFetcher
 from parsers.chop_moscow import ChopMoscowParser
 from parsers.prochop_ru import ProchopRuParser
+from parsers.russkii_souz import RusskiiSouzParser
 from parsers.vsechopy_ru import VseChopyRuParser
 
 PARSERS_MAP = {
     "chop_moscow": ChopMoscowParser,
     "prochop_ru": ProchopRuParser,
     "vsechopy_ru": VseChopyRuParser,
+    "russkii_souz": RusskiiSouzParser,
 }
 
 

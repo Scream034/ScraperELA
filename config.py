@@ -145,6 +145,15 @@ SITES: dict[str, dict[str, Any]] = {
         "detail_concurrency": 6,
         "page_pattern": "{base_url}?page={page}",
     },
+    "russkii_souz": {
+        "name": "Русский союз — Охранные предприятия (русскийсоюз.рф)",
+        "base_url": "https://xn--g1abdcwihado2k.xn--p1ai/russia/services/okhrannye_predpriiatiia__detektivy/",
+        "parser_key": "russkii_souz",
+        "max_pages": 0,
+        "catalog_concurrency": 2,
+        "detail_concurrency": 4,
+        "page_pattern": "{base_url}?page={page}",
+    },
 }
 
 
